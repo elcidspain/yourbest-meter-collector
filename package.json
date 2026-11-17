@@ -1,0 +1,25 @@
+{
+  "name": "yourbest-meter-collector",
+  "version": "0.3.0",
+  "description": "Observed AI usage collector and provider usage adapters from YourBest METER and AUMARA.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.15.0" },
+  "bin": {
+    "yourbest-meter": "./cli/meter-scan.mjs",
+    "yourbest-meter-daemon": "./cli/meter-daemon.mjs"
+  },
+  "exports": {
+    "./collector": "./cli/meter-scan.mjs",
+    "./providers": "./lib/meter/providers.js"
+  },
+  "scripts": {
+    "scan": "node cli/meter-scan.mjs",
+    "daemon": "node cli/meter-daemon.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "files": ["cli", "lib", "scripts", "README.md", "LICENSE"],
+  "repository": { "type": "git", "url": "https://github.com/elcidspain/yourbest-meter-collector.git" },
+  "homepage": "https://yourbest.space/meter",
+  "keywords": ["ai", "telemetry", "tokens", "mcp", "codex", "claude", "cursor", "grok", "aumara", "yourbest"]
+}
