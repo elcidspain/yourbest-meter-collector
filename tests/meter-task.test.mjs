@@ -38,4 +38,15 @@ test('signed tasks decrypt only their configured key file and keep private key o
 test('Windows task definition stays disabled by default and escapes account/path values',()=>{
  const xml=taskXml({account:'TEST\\Synthetic',node:"C:\\Program Files\\node.exe",runner:"C:\\Synthetic's & data\\meter-task.mjs",config:'C:\\Synthetic\\config.json',powershell:'C:\\Windows\\powershell.exe',start:'2026-11-17T16:00:00Z'});
  assert.ok(xml.includes('<Interval>PT5M</Interval>'));assert.ok(xml.includes('<Enabled>false</Enabled>'));assert.ok(xml.includes('<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'));assert.ok(xml.includes('<RunLevel>LeastPrivilege</RunLevel>'));assert.ok(xml.includes('Synthetic&apos;&apos;s &amp; data'));assert.ok(!xml.includes('ExecutionPolicy'));assert.ok(!xml.includes('PRIVATE KEY'));
+ assert.ok(xml.includes('<ExecutionTimeLimit>PT45M</ExecutionTimeLimit>'));assert.ok(xml.includes('<Priority>5</Priority>'));
+});
+
+test('task opts into its local cache and records a sanitized durable-publication receipt',async t=>{
+ const {dir,config}=fixture(t,{cache_file:'event-cache.json',publish_endpoint:'https://example.invalid/api/meter?op=publish_snapshot'});
+ const result=await runTask(config,{scan:async options=>{assert.equal(options.cacheFile,path.join(dir,'event-cache.json'));options.onCache({hits:9,misses:1});return snapshot();},readCredential:()=> 'PRIVATE',publish:async()=>({persisted:true,status:200,storage:'supabase',sha256:'a'.repeat(64),private_key:'NEVER-SAVE'})});
+ assert.equal(result.cache.hits,9);assert.equal(result.publication.persisted,true);assert.equal(result.publication.http_status,200);assert.equal(result.publication.sha256,'a'.repeat(64));assert.ok(result.collection_duration_ms>=0);assert.ok(!JSON.stringify(result).includes('NEVER-SAVE'));
+});
+
+test('cache filename cannot overwrite snapshot, configuration or parent paths',async t=>{
+ for(const cache_file of ['snapshot.json','config.json','CONFIG.JSON','last-run.json','../outside.json']){const {config}=fixture(t,{cache_file});await assert.rejects(()=>runTask(config),/invalid_cache_file/);}
 });

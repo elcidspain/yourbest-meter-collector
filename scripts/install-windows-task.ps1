@@ -20,12 +20,12 @@ foreach ($meterPart in @('cli','lib')) {
   $meterTo = Join-Path $InstallDirectory $meterPart
   if ([IO.Path]::GetFullPath($meterFrom) -ne [IO.Path]::GetFullPath($meterTo)) { Copy-Item -LiteralPath $meterFrom -Destination $InstallDirectory -Recurse -Force }
 }
-$meterConfig = @{version=1;output='snapshot.json';publish_endpoint=$PublishEndpoint}
+$meterConfig = @{version=1;output='snapshot.json';cache_file='event-cache.json';publish_endpoint=$PublishEndpoint}
 if ($CredentialMode -eq 'ed25519') { $meterConfig.signing_key_file='publish-key.dpapi' } else { $meterConfig.token_file='publish-token.dpapi' }
 [IO.File]::WriteAllText($meterConfigPath,($meterConfig | ConvertTo-Json),[Text.UTF8Encoding]::new($false))
 $meterAction = New-ScheduledTaskAction -Execute $meterNode -Argument ('"'+(Join-Path $InstallDirectory 'cli\meter-task.mjs')+'" --config "'+$meterConfigPath+'"') -WorkingDirectory $InstallDirectory
 $meterTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 5)
-$meterSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+$meterSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 45) -Priority 5
 $meterPrincipal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 $meterTask = New-ScheduledTask -Action $meterAction -Trigger $meterTrigger -Settings $meterSettings -Principal $meterPrincipal -Description 'YourBest METER / AUMARA: sanitized local AI usage snapshot every five minutes.'
 Register-ScheduledTask -TaskName $meterTaskName -InputObject $meterTask -Force | Out-Null

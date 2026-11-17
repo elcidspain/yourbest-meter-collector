@@ -20,3 +20,6 @@ collector.lock
 coverage/
 dist/
 
+
+event-cache.json
+*event-cache*.json

@@ -27,7 +27,7 @@ export function acquireLock(file,{now=Date.now(),isAlive=alive}={}){
 
 export function readWindowsCredential(tokenFile){
  if(process.platform!=='win32')throw Error('dpapi_requires_windows');
- const script="$ErrorActionPreference='Stop'; $s=Get-Content -LiteralPath $env:YOURBEST_METER_TOKEN_FILE -Raw | ConvertTo-SecureString; $p=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($s); try { [Console]::Write([Runtime.InteropServices.Marshal]::PtrToStringBSTR($p)) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) }";
+ const script="$ErrorActionPreference='Stop'; $s=(Get-Content -LiteralPath $env:YOURBEST_METER_TOKEN_FILE -Raw).Trim() | ConvertTo-SecureString; $p=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($s); try { [Console]::Write([Runtime.InteropServices.Marshal]::PtrToStringBSTR($p)) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) }";
  const result=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{env:{...process.env,YOURBEST_METER_TOKEN_FILE:tokenFile},encoding:'utf8',windowsHide:true,timeout:10000,maxBuffer:16384});
  if(result.status!==0||!result.stdout||result.stdout.length>8192)throw Error('publication_credential_unavailable');
  return result.stdout;
@@ -38,18 +38,24 @@ function writeJson(file,value){const temporary=file+'.'+randomUUID()+'.tmp';fs.w
 export async function runTask(configFile,{scan=createSnapshot,publish=publishSnapshot,readCredential=readWindowsCredential,sleep=wait}={}){
  const folder=path.dirname(path.resolve(configFile)),config=JSON.parse(fs.readFileSync(configFile,'utf8'));
  if(config.version!==1||!config.output||!/^[A-Za-z0-9._-]+\.json$/.test(config.output))throw Error('invalid_task_configuration');
+ if(config.cache_file&&(!/^[A-Za-z0-9._-]+\.json$/.test(config.cache_file)||['config.json','last-run.json',config.output.toLowerCase()].includes(config.cache_file.toLowerCase())))throw Error('invalid_cache_file');
  const signing=Boolean(config.signing_key_file),tokenName=config.signing_key_file||config.token_file||'publish-token.dpapi';
  if(!/^[A-Za-z0-9._-]+\.dpapi$/.test(tokenName))throw Error('invalid_token_file');
  const release=acquireLock(path.join(folder,'collector.lock'));
  if(!release)return {ok:true,skipped:'already_running'};
  const status={started_at:new Date().toISOString(),publishing_requested:Boolean(config.publish_endpoint),published:false};
  try{
-  const snapshot=await scan();writeJson(path.join(folder,config.output),snapshot);
+  const collectionStarted=Date.now();
+  const snapshot=await scan(config.cache_file?{cacheFile:path.join(folder,config.cache_file),onCache:value=>{status.cache=value;}}:{});
+  status.collection_duration_ms=Date.now()-collectionStarted;writeJson(path.join(folder,config.output),snapshot);
   status.source_scanned_at=snapshot.scanned_at;status.items=snapshot.items.length;
   if(config.publish_endpoint){
    const credential=readCredential(path.join(folder,tokenName));let last;
    for(let attempt=0;attempt<3;attempt++){
-    try{await publish(snapshot,{endpoint:config.publish_endpoint,...(signing?{signingKey:credential}:{token:credential})});status.published=true;status.publication_attempts=attempt+1;status.publication_auth=signing?'ed25519':'bearer';last=null;break;}
+    try{const receipt=await publish(snapshot,{endpoint:config.publish_endpoint,...(signing?{signingKey:credential}:{token:credential})});
+     if(receipt?.persisted!==true)throw Error('publication_not_persisted');
+     status.publication={persisted:true,...(Number.isInteger(receipt.status)?{http_status:receipt.status}:{}),...(receipt.storage==='supabase'?{storage:receipt.storage}:{}),...(/^[a-f0-9]{64}$/.test(receipt.sha256)?{sha256:receipt.sha256}:{}),source_scanned_at:snapshot.scanned_at};
+     status.published=true;status.publication_attempts=attempt+1;status.publication_auth=signing?'ed25519':'bearer';last=null;break;}
     catch(error){last=error;if(attempt<2)await sleep(1000*2**attempt);}
    }
    if(last)throw Error('publication_failed_after_retries');

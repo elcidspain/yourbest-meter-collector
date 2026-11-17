@@ -57,6 +57,18 @@ The task calls `cli/meter-task.mjs` from `%LOCALAPPDATA%\YourBestMeter`. The def
 
 Scheduled runs use a process lock, atomic snapshot replacement, three publication attempts for the same measured snapshot and an aggregate `last-run.json` status file. Failed publication preserves the local snapshot and is retried on a subsequent run. Task Scheduler uses `IgnoreNew` to prevent overlapping task instances. Collection resumes when the signed-in device becomes available after a missed run; it cannot collect while the device is off.
 
+### Bounded local event cache
+
+The Windows installers enable `cache_file: "event-cache.json"` in the local task configuration. Standalone CLI scans remain uncached. Library callers can opt in with `createSnapshot({ cacheFile })`; the optional `onCache` callback receives aggregate cache statistics.
+
+The cache contains allowlisted normalized counters, hashed event identities, model/source names and original event timestamps. It contains no prompts, completions, tool arguments, raw session IDs, source paths or credentials. It is local to the collecting device and is never included in the published snapshot.
+
+An unchanged file is reused only when its identity, size and modification metadata match. Source streams use a bounded 1 MiB read buffer, a 60-second idle timeout and one full retry after a stalled read. Failed partial parses are discarded. Changed, truncated, replaced or actively growing files are reparsed completely; files changing during a read are not cached. Global event-ID deduplication and the 7/14/30-day windows are recomputed for every scan. Cached records retain their original `observed_from` / `observed_to` timestamps; `scanned_at` describes the new inspection, not newly generated usage.
+
+The cache retains 31 days of normalized events, including a one-day margin around the largest reporting window. It is capped at 32 MiB, 2,048 source files and 200,000 events. Oversized entries are left uncached without dropping them from the measured scan. Cache corruption, parser-version changes and incompatible clock rollback cause source rereading. Writes use atomic replacement. Files no longer present in the scan are removed from the cache. Volatile Cursor SQLite databases are always read directly so WAL changes cannot be hidden by a database-file fingerprint.
+
+The first cached scan reads the full retained logs. Later scans reuse unchanged text logs and read only changed files. `last-run.json` records collection duration, cache hits/misses and a sanitized durable-publication receipt. A five-minute trigger is not a guarantee of five-minute freshness: `IgnoreNew` skips a trigger while collection is still running. The task uses Normal priority and a 45-minute execution limit to accommodate an initial full pass; inspect actual run duration and the public snapshot's `source_scanned_at`.
+
 ## Provider usage adapters
 
 `lib/meter/providers.js` exports `extractUsage(provider, response)` and `createUsageCollector(provider)` for callers instrumenting their own authorized API requests. The collector preserves the provider-reported total, cumulative SSE counters and available cost fields. It supports OpenAI, Anthropic, Gemini, xAI and Perplexity response shapes.

@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import readline from 'node:readline';
 import * as zlib from 'node:zlib';
 import { pathToFileURL } from 'node:url';
+import { createEventCache } from './meter-cache.mjs';
 
 export const WINDOWS = [7, 14, 30];
 const DAY = 86400000;
@@ -99,13 +100,13 @@ function walkFiles(root, accept, depth = 0) {
 async function forEachLine(file, consume) {
   if (file.endsWith('.zst') && !zlib.createZstdDecompress) throw new Error('unsupported_zstd');
   return new Promise((resolve, reject) => {
-    const raw = fs.createReadStream(file);
+    const raw = fs.createReadStream(file, { highWaterMark: 1024 * 1024 });
     const input = file.endsWith('.zst') ? raw.pipe(zlib.createZstdDecompress()) : raw;
     const lines = readline.createInterface({ input, crlfDelay: Infinity });
     let done = false;
-    let timer = setTimeout(() => finish(new Error('read_timeout')), 15000);
+    let timer = setTimeout(() => finish(new Error('read_timeout')), 60000);
     // Bound stalled I/O, while allowing a large readable log to finish.
-    input.on('data', () => { clearTimeout(timer); timer = setTimeout(() => finish(new Error('read_timeout')), 15000); });
+    input.on('data', () => { clearTimeout(timer); timer = setTimeout(() => finish(new Error('read_timeout')), 60000); });
     function finish(error) {
       if (done) return; done = true; clearTimeout(timer);
       lines.close(); input.destroy(); raw.destroy();
@@ -380,21 +381,38 @@ export function aggregateEvents(events, now = Date.now()) {
   return { items, events: [...unique.values()], duplicates: events.length - unique.size };
 }
 
-export async function scanLocalUsage(paths = localPaths(), now = Date.now(), onProgress = () => {}) {
+export async function scanLocalUsage(paths = localPaths(), now = Date.now(), onProgress = () => {}, cache = null) {
   const events = [], sources = [];
+  const retries = new Map();
+  const read = (file, source, parser, parse) => {
+    const completeParse = async () => {
+      try { return await parse(); }
+      catch (error) {
+        if (error.message !== 'read_timeout') throw error;
+        retries.set(source, (retries.get(source) || 0) + 1);
+        onProgress({ source, retrying_stalled_file: true });
+        return parse(); // Fresh parser state; partial first-attempt events are discarded.
+      }
+    };
+    return cache ? cache.read(file, source, parser, completeParse) : completeParse();
+  };
   const codex = sourceMeta('codex', 'local_token_telemetry');
   const codexFiles = [...walkFiles(path.join(paths.codex, 'sessions'), name => /\.jsonl(?:\.zst)?$/.test(name)),
     ...walkFiles(path.join(paths.codex, 'archived_sessions'), name => /\.jsonl(?:\.zst)?$/.test(name))];
   let cursor = 0, completed = 0;
   async function worker() {
     while (cursor < codexFiles.length) {
-      const file = codexFiles[cursor++], parser = createCodexParser(digest(file));
+      const file = codexFiles[cursor++];
       try {
-        await forEachLine(file, line => {
-          if (!/"(?:session_meta|turn_context|token_usage_record|token_count)"/.test(line)) return;
-          try { parser.consume(JSON.parse(line)); } catch { codex.invalid_records++; }
+        const parsed = await read(file, 'codex', 'codex', async () => {
+          const parser = createCodexParser(digest(file)); let invalid = 0;
+          await forEachLine(file, line => {
+            if (!/"(?:session_meta|turn_context|token_usage_record|token_count)"/.test(line)) return;
+            try { parser.consume(JSON.parse(line)); } catch { invalid++; }
+          });
+          const result = parser.finish(); return { events: result.events, invalid: invalid + result.invalid };
         });
-        const parsed = parser.finish(); events.push(...parsed.events); codex.invalid_records += parsed.invalid;
+        events.push(...parsed.events); codex.invalid_records += parsed.invalid;
         codex.files_scanned++;
       } catch (error) {
         codex.files_failed++;
@@ -415,39 +433,48 @@ export async function scanLocalUsage(paths = localPaths(), now = Date.now(), onP
   for (const file of walkFiles(grokSessions, name => name === 'usage.json')) {
     try {
       if (fs.statSync(file).size > 16777216) { grok.unsupported_files++; continue; }
-      const result = parseGrokUsage(JSON.parse(fs.readFileSync(file, 'utf8')), digest(path.dirname(file)));
+      const result = await read(file, 'grok_build', 'usage', async () => parseGrokUsage(JSON.parse(fs.readFileSync(file, 'utf8')), digest(path.dirname(file))));
       events.push(...result.events); grok.invalid_records += result.invalid; grok.files_scanned++;
-      if (result.events.length || !result.invalid) measuredSessions.add(path.dirname(file));
+      if (result.has_events || result.events.length || !result.invalid) measuredSessions.add(path.dirname(file));
     } catch { grok.files_failed++; }
   }
   for (const file of walkFiles(grokSessions, name => name === 'updates.jsonl')) {
     if (measuredSessions.has(path.dirname(file))) continue;
     try {
-      await forEachLine(file, line => {
-        if (!line.includes('turn_completed')) return;
-        try { const result = parseGrokUpdate(JSON.parse(line)); if (result) { events.push(...result.events); grok.invalid_records += result.invalid; } }
-        catch { grok.invalid_records++; }
+      const parsed = await read(file, 'grok_build', 'updates', async () => {
+        const events = []; let invalid = 0;
+        await forEachLine(file, line => {
+          if (!line.includes('turn_completed')) return;
+          try { const result = parseGrokUpdate(JSON.parse(line)); if (result) { events.push(...result.events); invalid += result.invalid; } }
+          catch { invalid++; }
+        });
+        return { events, invalid };
       });
+      events.push(...parsed.events); grok.invalid_records += parsed.invalid;
       grok.files_scanned++;
     } catch (error) { grok.files_failed++; if (error.message === 'read_timeout') grok.timed_out_files++; }
   }
   // Completed tool records have stable call IDs. Started records have no ID and
   // are deliberately not mixed with completions or token/model-call counts.
   for (const file of walkFiles(grokSessions, name => name === 'events.jsonl')) {
-    let session = digest(path.dirname(file)), model = 'unknown';
     try {
-      await forEachLine(file, line => {
-        if (!/"(?:turn_started|tool_completed)"/.test(line)) return;
-        let record; try { record = JSON.parse(line); } catch { grok.invalid_records++; return; }
-        if (record.type === 'turn_started') {
-          if (typeof record.session_id === 'string') session = record.session_id;
-          model = modelName(record.model_id); return;
-        }
-        const timestamp = timestampMs(record.ts);
-        if (record.type !== 'tool_completed' || !Number.isFinite(timestamp) || typeof record.tool_call_id !== 'string') return;
-        events.push({ key: digest(`grok-tool:${session}:${record.tool_call_id}`), timestamp, source: 'grok_build', model,
-          unit: 'tool_calls', amount: 1, method: 'timestamped_completed_tool_calls' });
+      const parsed = await read(file, 'grok_build', 'events', async () => {
+        let session = digest(path.dirname(file)), model = 'unknown', invalid = 0; const events = [];
+        await forEachLine(file, line => {
+          if (!/"(?:turn_started|tool_completed)"/.test(line)) return;
+          let record; try { record = JSON.parse(line); } catch { invalid++; return; }
+          if (record.type === 'turn_started') {
+            if (typeof record.session_id === 'string') session = record.session_id;
+            model = modelName(record.model_id); return;
+          }
+          const timestamp = timestampMs(record.ts);
+          if (record.type !== 'tool_completed' || !Number.isFinite(timestamp) || typeof record.tool_call_id !== 'string') return;
+          events.push({ key: digest(`grok-tool:${session}:${record.tool_call_id}`), timestamp, source: 'grok_build', model,
+            unit: 'tool_calls', amount: 1, method: 'timestamped_completed_tool_calls' });
+        });
+        return { events, invalid };
       });
+      events.push(...parsed.events); grok.invalid_records += parsed.invalid;
       grok.files_scanned++;
     } catch (error) { grok.files_failed++; if (error.message === 'read_timeout') grok.timed_out_files++; }
   }
@@ -458,13 +485,18 @@ export async function scanLocalUsage(paths = localPaths(), now = Date.now(), onP
   const claudeCode = sourceMeta('claude_code', 'claude_code_message_usage');
   for (const file of walkFiles(path.join(paths.claudeCode, 'projects'), name => /\.jsonl$/.test(name))) {
     try {
-      await forEachLine(file, line => {
-        if (!/"usage"\s*:/.test(line)) return;
-        let record; try { record = JSON.parse(line); } catch { claudeCode.invalid_records++; return; }
-        const event = parseClaudeCodeRecord(record);
-        if (event) events.push(event);
-        else if (record.type === 'assistant' && record.message?.usage) claudeCode.invalid_records++;
+      const parsed = await read(file, 'claude_code', 'messages', async () => {
+        const events = []; let invalid = 0;
+        await forEachLine(file, line => {
+          if (!/"usage"\s*:/.test(line)) return;
+          let record; try { record = JSON.parse(line); } catch { invalid++; return; }
+          const event = parseClaudeCodeRecord(record);
+          if (event) events.push(event);
+          else if (record.type === 'assistant' && record.message?.usage) invalid++;
+        });
+        return { events, invalid };
       });
+      events.push(...parsed.events); claudeCode.invalid_records += parsed.invalid;
       claudeCode.files_scanned++;
     } catch (error) { claudeCode.files_failed++; if (error.message === 'read_timeout') claudeCode.timed_out_files++; }
   }
@@ -489,7 +521,12 @@ export async function scanLocalUsage(paths = localPaths(), now = Date.now(), onP
 
   const commander = sourceMeta('desktop_commander', 'timestamped_tool_calls');
   for (const file of walkFiles(paths.commander, name => /^claude_tool_call(?:_.*)?\.log$/.test(name))) {
-    try { await forEachLine(file, line => { const event = parseCommanderLine(line); if (event) events.push(event); }); commander.files_scanned++; }
+    try {
+      const parsed = await read(file, 'desktop_commander', 'calls', async () => {
+        const events = []; await forEachLine(file, line => { const event = parseCommanderLine(line); if (event) events.push(event); }); return { events, invalid: 0 };
+      });
+      events.push(...parsed.events); commander.files_scanned++;
+    }
     catch (error) { commander.files_failed++; if (error.message === 'read_timeout') commander.timed_out_files++; }
   }
   commander.notes.push('Counts logged local tool invocations. Tool calls do not identify model tokens or charges.');
@@ -498,8 +535,11 @@ export async function scanLocalUsage(paths = localPaths(), now = Date.now(), onP
   const claude = sourceMeta('claude_mcp', 'timestamped_tool_calls');
   for (const file of walkFiles(paths.claudeLogs, name => /mcp.*\.log(?:\.\d+)?$/.test(name))) {
     try {
-      const server = path.basename(file).replace(/\.log.*$/, '');
-      await forEachLine(file, line => { const event = parseClaudeLine(line, server); if (event) events.push(event); });
+      const parsed = await read(file, 'claude_mcp', 'calls', async () => {
+        const server = path.basename(file).replace(/\.log.*$/, ''), events = [];
+        await forEachLine(file, line => { const event = parseClaudeLine(line, server); if (event) events.push(event); }); return { events, invalid: 0 };
+      });
+      events.push(...parsed.events);
       claude.files_scanned++;
     } catch (error) { claude.files_failed++; if (error.message === 'read_timeout') claude.timed_out_files++; }
   }
@@ -508,6 +548,7 @@ export async function scanLocalUsage(paths = localPaths(), now = Date.now(), onP
 
   const aggregated = aggregateEvents(events, now);
   for (const source of sources) {
+    source.files_retried = retries.get(source.source) || 0;
     const all = aggregated.events.filter(event => event.source === source.source);
     const recent = all.filter(event => event.timestamp >= now - 30 * DAY);
     source.records = recent.length;
@@ -580,9 +621,11 @@ export async function fetchOpenAiUsage({ key = process.env.OPENAI_ADMIN_KEY, now
   return { items, source };
 }
 
-export async function createSnapshot({ home = os.homedir(), platform = os.platform(), env = process.env, now = Date.now(), fetchImpl = fetch, onProgress = () => {} } = {}) {
+export async function createSnapshot({ home = os.homedir(), platform = os.platform(), env = process.env, now = Date.now(), fetchImpl = fetch, onProgress = () => {}, cacheFile = null, onCache = () => {} } = {}) {
   const paths = localPaths(home, platform);
-  const local = await scanLocalUsage(paths, now, onProgress);
+  const cache = cacheFile ? createEventCache(cacheFile, { now }) : null;
+  const local = await scanLocalUsage(paths, now, onProgress, cache);
+  if (cache) onCache(cache.save());
   const api = await fetchOpenAiUsage({ key: env.OPENAI_ADMIN_KEY || null, now, fetchImpl });
   return {
     schema_version: 'meter.local.v1',
@@ -621,7 +664,9 @@ export async function publishSnapshot(snapshot, {
   const report = await response.json();
   if (report.persisted !== true) throw new Error('Meter accepted the request without confirming durable snapshot storage.');
   return { delivered: true, status: response.status, persisted: true, mode: 'published_local_snapshot',
-    source_scanned_at: report.source_scanned_at || snapshot.scanned_at };
+    source_scanned_at: report.source_scanned_at || snapshot.scanned_at,
+    ...(report.storage === 'supabase' ? { storage: report.storage } : {}),
+    ...(/^[a-f0-9]{64}$/.test(report.sha256) ? { sha256: report.sha256 } : {}) };
 }
 
 export function canonicalJson(value) {
