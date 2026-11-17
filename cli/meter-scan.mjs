@@ -284,7 +284,7 @@ export function parseCursorRecord(record, rowIdentity = 'record') {
         cached_tokens: cached, method: 'cursor_sqlite_explicit_usage' });
       return;
     }
-    for (const key of ['usageEvents', 'events', 'records', 'data', 'bubbles', 'conversation', 'fullConversation', 'allComposers', 'composers']) {
+    for (const key of ['usageEvents', 'events', 'records', 'data', 'bubbles', 'conversation', 'fullConversation', 'allComposers', 'composers', 'prompts', 'messages', 'composerData', 'history', 'aiService']) {
       if (value[key] && typeof value[key] === 'object') visit(value[key], `${identity}:${key}`, depth + 1);
     }
   }
@@ -303,7 +303,7 @@ export async function readCursorDatabase(file) {
     for (const { name } of tables) {
       const columns = db.prepare(`PRAGMA table_info("${name}")`).all().map(column => column.name);
       if (!columns.includes('key') || !columns.includes('value')) continue;
-      const query = db.prepare(`SELECT key, value FROM "${name}" WHERE length(value) <= 16777216 AND (key LIKE 'bubbleId:%' OR key LIKE 'composerData:%' OR lower(key) LIKE '%usage%')`);
+      const query = db.prepare(`SELECT key, value FROM "${name}" WHERE length(value) <= 16777216 AND (key LIKE 'bubbleId:%' OR key LIKE 'composerData:%' OR lower(key) LIKE '%usage%' OR key IN ('aiService.prompts','workbench.panel.composerChatViewPane'))`);
       for (const row of query.iterate()) {
         if (/auth|secret|credential|api.?key|access.?token|refresh.?token/i.test(row.key)) continue;
         rows++;
